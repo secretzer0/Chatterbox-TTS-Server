@@ -608,6 +608,106 @@ def warmup_batch(audio_prompt_path: Optional[str]) -> bool:
 
 
 @torch.inference_mode()
+def _t3_inference_padded(
+    model,
+    t3_cond,
+    text_tokens: torch.Tensor,
+    text_mask: torch.Tensor,
+    temperature: float = 0.8,
+    top_k: int = 1000,
+    top_p: float = 0.95,
+    repetition_penalty: float = 1.2,
+    max_gen_len: int = 1000,
+) -> torch.Tensor:
+    """T3.inference_turbo, but pad-aware.
+
+    The packaged inference_turbo takes no attention_mask, so a batch of
+    unequal texts is right-padded with EOS and every pad is READ AS TEXT: a
+    short row keeps voicing past its words until the longest row stops. This
+    reimplements the same decode loop and passes the tokenizer's mask through
+    to the transformer, plus per-row position_ids (turbo's T3 is GPT2 with
+    absolute learned positions, so real tokens must stay contiguous across the
+    masked pads). Rows that emit stop are frozen on stop so the caller's
+    truncate-at-first-stop keeps working. Sampling, processors and the first
+    prompt-step are copied from inference_turbo so a batch of one is the same
+    computation.
+    """
+    from transformers.generation.logits_process import (
+        LogitsProcessorList,
+        RepetitionPenaltyLogitsProcessor,
+        TemperatureLogitsWarper,
+        TopKLogitsWarper,
+        TopPLogitsWarper,
+    )
+    import torch.nn.functional as F
+
+    t3 = model.t3
+    device = text_tokens.device
+    batch = text_tokens.size(0)
+
+    processors = LogitsProcessorList()
+    if temperature > 0 and temperature != 1.0:
+        processors.append(TemperatureLogitsWarper(temperature))
+    if top_k > 0:
+        processors.append(TopKLogitsWarper(top_k))
+    if top_p < 1.0:
+        processors.append(TopPLogitsWarper(top_p))
+    if repetition_penalty != 1.0:
+        processors.append(RepetitionPenaltyLogitsProcessor(repetition_penalty))
+
+    stop = t3.hp.stop_speech_token
+    speech_start = t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+    embeds, len_cond = t3.prepare_input_embeds(
+        t3_cond=t3_cond,
+        text_tokens=text_tokens,
+        speech_tokens=speech_start,
+        cfg_weight=0.0,
+    )
+    ones = lambda n: torch.ones(batch, n, dtype=torch.long, device=device)
+    mask = torch.cat([ones(len_cond), text_mask.to(device).long(), ones(1)], dim=1)
+    position_ids = (mask.cumsum(dim=1) - 1).clamp(min=0)
+
+    out = t3.tfmr(
+        inputs_embeds=embeds,
+        attention_mask=mask,
+        position_ids=position_ids,
+        use_cache=True,
+    )
+    past = out.past_key_values
+    logits = t3.speech_head(out[0][:, -1:])[:, -1, :]
+    next_pos = position_ids[:, -1:] + 1
+
+    generated: List[torch.Tensor] = []
+    done = torch.zeros(batch, dtype=torch.bool, device=device)
+    history = speech_start
+    for _ in range(max_gen_len + 1):
+        processed = processors(history, logits)
+        if torch.all(processed == -float("inf")):
+            logger.warning("Padded batch decode: all logits are -inf; stopping.")
+            break
+        probs = F.softmax(processed, dim=-1)
+        token = torch.multinomial(probs, num_samples=1)
+        token = torch.where(done.unsqueeze(1), torch.full_like(token, stop), token)
+        generated.append(token)
+        done |= token.squeeze(1) == stop
+        if bool(done.all()):
+            break
+        history = torch.cat(generated, dim=1)
+        mask = torch.cat([mask, ones(1)], dim=1)
+        out = t3.tfmr(
+            inputs_embeds=t3.speech_emb(token),
+            past_key_values=past,
+            attention_mask=mask,
+            position_ids=next_pos,
+            use_cache=True,
+        )
+        past = out.past_key_values
+        logits = t3.speech_head(out[0])[:, -1, :]
+        next_pos = next_pos + 1
+
+    return torch.cat(generated, dim=1)
+
+
 def synthesize_batch(
     texts: List[str],
     audio_prompt_path: Optional[str] = None,
@@ -650,18 +750,18 @@ def synthesize_batch(
             text_tokens = encoded.input_ids.to(model.device)
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16_ENABLED):
-                all_tokens = model.t3.inference_turbo(
-                    t3_cond=conds.t3,
-                    text_tokens=text_tokens,
+                all_tokens = _t3_inference_padded(
+                    model,
+                    conds.t3,
+                    text_tokens,
+                    encoded.attention_mask,
                     temperature=temperature,
                 )
 
             for row_idx in range(all_tokens.size(0)):
                 row = all_tokens[row_idx]
-                # inference_turbo only breaks once EVERY row has emitted stop, so
-                # rows that finished early keep sampling. Those trailing tokens are
-                # below the OOV limit and would survive the filter as audible
-                # gibberish, so truncate at the first stop before filtering.
+                # Rows that finished early are frozen on stop by the padded
+                # decode; truncate at the first stop before filtering.
                 hit = (row == stop_token).nonzero()
                 if hit.numel():
                     row = row[: hit[0, 0]]
