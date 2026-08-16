@@ -607,6 +607,7 @@ def warmup_batch(audio_prompt_path: Optional[str]) -> bool:
         return False
 
 
+@torch.inference_mode()
 def synthesize_batch(
     texts: List[str],
     audio_prompt_path: Optional[str] = None,
