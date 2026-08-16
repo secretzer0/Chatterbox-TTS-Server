@@ -63,6 +63,35 @@ from config import (
 )
 
 import engine  # TTS Engine interface
+
+# Stream path: chunk 1 is re-cut to at most this many characters and synthesized
+# alone, so the first bytes leave after one short utterance; 0 disables.
+def _resolve_first_chunk_chars() -> int:
+    raw = os.environ.get("TTS_FIRST_CHUNK_CHARS", "60").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 60
+
+
+_FIRST_CHUNK_CHARS: int = _resolve_first_chunk_chars()
+
+
+def _short_head(text: str, limit: int):
+    """Split `text` into a short first utterance and the remainder. Sentence
+    boundary first; when the first sentence is itself longer than `limit`, cut
+    at the last clause mark (, ; :) inside the limit so the head is a phrase the
+    voice can carry, not a fragment. Returns (head, remainder); remainder is ""
+    when the text is one short piece."""
+    parts = utils.chunk_text_by_sentences(text, limit)
+    if not parts:
+        return text, ""
+    head, rest = parts[0], " ".join(parts[1:])
+    if len(head) > limit:
+        cut = max(head.rfind(c, 0, limit + 1) for c in ",;:")
+        if cut >= 12:
+            head, rest = head[: cut + 1].strip(), (head[cut + 1 :].strip() + " " + rest).strip()
+    return head, rest
 from models import (  # Pydantic models
     CustomTTSRequest,
     ErrorResponse,
@@ -1019,27 +1048,68 @@ async def custom_tts_endpoint(
 
         CROSSFADE_MS_STREAM = 20
 
+        # FIRST CHUNK SOLO, REST BATCHED. Time-to-first-sound is the time to
+        # synthesize chunk 1, so chunk 1 is re-cut SHORT (TTS_FIRST_CHUNK_CHARS,
+        # 0 keeps the request's chunking) and generated alone; everything after
+        # it goes through synthesize_batch in one pass (or per chunk when
+        # batching declines) and is yielded in order. Total stays near the
+        # batched whole-file path; first sound drops to one short chunk.
+        stream_chunks = list(text_chunks)
+        if _FIRST_CHUNK_CHARS > 0 and len(request.text) > _FIRST_CHUNK_CHARS:
+            first, remainder = _short_head(request.text, _FIRST_CHUNK_CHARS)
+            if remainder:
+                rest = utils.chunk_text_by_sentences(
+                    remainder, request.chunk_size if request.chunk_size else 120
+                )
+                stream_chunks = [first] + rest
+                logger.info(
+                    f"Stream: first chunk {len(first)} chars solo, {len(rest)} chunk(s) batched."
+                )
+
         async def _stream_generator():
             loop = asyncio.get_running_loop()
             carry: Optional[np.ndarray] = None
             header_sent = False
 
-            for i, chunk_text in enumerate(text_chunks):
-                is_last = i == len(text_chunks) - 1
-                logger.info(f"Streaming chunk {i+1}/{len(text_chunks)}...")
-
-                audio_tensor, chunk_sr = await loop.run_in_executor(
-                    None,
-                    lambda c=chunk_text: engine.synthesize(
-                        text=c,
-                        audio_prompt_path=audio_prompt_str,
-                        temperature=temperature_val,
-                        exaggeration=exaggeration_val,
-                        cfg_weight=cfg_weight_val,
-                        seed=seed_val,
-                        language=language_val,
-                    ),
+            def synth_one(c):
+                return engine.synthesize(
+                    text=c,
+                    audio_prompt_path=audio_prompt_str,
+                    temperature=temperature_val,
+                    exaggeration=exaggeration_val,
+                    cfg_weight=cfg_weight_val,
+                    seed=seed_val,
+                    language=language_val,
                 )
+
+            def synth_rest(chunks):
+                wavs, sr = engine.synthesize_batch(
+                    texts=chunks,
+                    audio_prompt_path=audio_prompt_str,
+                    temperature=temperature_val,
+                    exaggeration=exaggeration_val,
+                    cfg_weight=cfg_weight_val,
+                    seed=seed_val,
+                    language=language_val,
+                )
+                if wavs is None:
+                    return None
+                return [(w, sr) for w in wavs]
+
+            batched = None
+            for i, chunk_text in enumerate(stream_chunks):
+                is_last = i == len(stream_chunks) - 1
+                logger.info(f"Streaming chunk {i+1}/{len(stream_chunks)}...")
+
+                if i == 0:
+                    audio_tensor, chunk_sr = await loop.run_in_executor(None, synth_one, chunk_text)
+                else:
+                    if i == 1:
+                        batched = await loop.run_in_executor(None, synth_rest, stream_chunks[1:])
+                    if batched is not None:
+                        audio_tensor, chunk_sr = batched[i - 1]
+                    else:
+                        audio_tensor, chunk_sr = await loop.run_in_executor(None, synth_one, chunk_text)
 
                 if audio_tensor is None or chunk_sr is None:
                     logger.error(f"Streaming TTS: engine returned None for chunk {i+1}; stopping stream.")
