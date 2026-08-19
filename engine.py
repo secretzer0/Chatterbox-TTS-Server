@@ -240,6 +240,26 @@ _conds_cache: "OrderedDict[tuple, object]" = OrderedDict()
 # removed.
 _conds_cache_lock = threading.Lock()
 
+# GENERATION IS SERIALISED, and it has to be for a correctness reason, not a
+# resource one. chatterbox_model.conds is PROCESS-WIDE state, and the
+# non-batched path below must assign it and then call generate(), which reads
+# it back off the model. Those two steps are not atomic: a second request that
+# assigns a different voice in between makes the first one generate in the
+# SECOND voice. The symptom is a single utterance that changes speaker partway
+# through and changes back -- reported from the field as a voice drifting
+# between two characters chunk by chunk, because split_text synthesises each
+# chunk with its own call.
+#
+# synthesize_batch avoids this by holding a local reference and never reading
+# the attribute back (see _resolve_conds). The non-batched path cannot: the
+# model's own generate() reads self.conds. So the assignment and the generate
+# are made atomic instead.
+#
+# This costs concurrency, and on the hardware this runs on there was none to
+# lose: TTS_BATCH_SIZE defaults to 1 and a second concurrent generation on a
+# 4 GB card OOMs anyway. Correct-and-serial beats concurrent-and-wrong.
+_generation_lock = threading.RLock()
+
 
 def _conds_cache_get(key: tuple):
     """Return cached conds for `key` and mark it most-recently-used, else None."""
@@ -944,46 +964,52 @@ def synthesize(
 
         # Voice conditioning cache: skip re-encoding the same voice file.
         # Turbo ignores exaggeration in conds; others include it in the key.
+        #
+        # THE LOCK SPANS THE ASSIGNMENT AND THE GENERATE, and nothing smaller
+        # would do: chatterbox_model.conds is process-wide, generate() reads it
+        # back off the model, and a request that reassigns it in between makes
+        # this one speak in that request's voice. See _generation_lock.
         effective_prompt = audio_prompt_path
         conds_key = None
-        if audio_prompt_path and hasattr(chatterbox_model, "conds"):
-            ex_for_key = 0.0 if loaded_model_type == "turbo" else exaggeration
-            conds_key = _conds_cache_key(audio_prompt_path, ex_for_key)
-            # Single locked lookup that also refreshes recency — checking
-            # membership and then indexing would race with eviction.
-            cached_conds = _conds_cache_get(conds_key)
-            if cached_conds is not None:
-                chatterbox_model.conds = cached_conds
-                effective_prompt = None  # conds already set, skip prepare_conditionals
-                logger.debug(f"Voice cache hit: {audio_prompt_path}")
+        with _generation_lock:
+            if audio_prompt_path and hasattr(chatterbox_model, "conds"):
+                ex_for_key = 0.0 if loaded_model_type == "turbo" else exaggeration
+                conds_key = _conds_cache_key(audio_prompt_path, ex_for_key)
+                # Single locked lookup that also refreshes recency — checking
+                # membership and then indexing would race with eviction.
+                cached_conds = _conds_cache_get(conds_key)
+                if cached_conds is not None:
+                    chatterbox_model.conds = cached_conds
+                    effective_prompt = None  # conds already set, skip prepare_conditionals
+                    logger.debug(f"Voice cache hit: {audio_prompt_path}")
 
-        # Call the core model's generate method.
-        # autocast promotes float32 inputs to bfloat16 to match T3/S3Gen weights,
-        # keeping numerically sensitive ops (softmax, norms) in float32 automatically.
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16_ENABLED):
-            if loaded_model_type == "multilingual":
-                wav_tensor = chatterbox_model.generate(
-                    text=text,
-                    language_id=language,
-                    audio_prompt_path=effective_prompt,
-                    temperature=temperature,
-                    exaggeration=exaggeration,
-                    cfg_weight=cfg_weight,
-                )
-            else:
-                wav_tensor = chatterbox_model.generate(
-                    text=text,
-                    audio_prompt_path=effective_prompt,
-                    temperature=temperature,
-                    exaggeration=exaggeration,
-                    cfg_weight=cfg_weight,
-                )
+            # Call the core model's generate method.
+            # autocast promotes float32 inputs to bfloat16 to match T3/S3Gen weights,
+            # keeping numerically sensitive ops (softmax, norms) in float32 automatically.
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16_ENABLED):
+                if loaded_model_type == "multilingual":
+                    wav_tensor = chatterbox_model.generate(
+                        text=text,
+                        language_id=language,
+                        audio_prompt_path=effective_prompt,
+                        temperature=temperature,
+                        exaggeration=exaggeration,
+                        cfg_weight=cfg_weight,
+                    )
+                else:
+                    wav_tensor = chatterbox_model.generate(
+                        text=text,
+                        audio_prompt_path=effective_prompt,
+                        temperature=temperature,
+                        exaggeration=exaggeration,
+                        cfg_weight=cfg_weight,
+                    )
 
-        # Store conds in cache after first compute for this voice.
-        if conds_key is not None and effective_prompt is not None:
-            if chatterbox_model.conds is not None:
-                _conds_cache_store(conds_key, chatterbox_model.conds)
-                logger.debug(f"Cached voice conditionals for: {audio_prompt_path}")
+            # Store conds in cache after first compute for this voice.
+            if conds_key is not None and effective_prompt is not None:
+                if chatterbox_model.conds is not None:
+                    _conds_cache_store(conds_key, chatterbox_model.conds)
+                    logger.debug(f"Cached voice conditionals for: {audio_prompt_path}")
 
         # The ChatterboxTTS.generate method already returns a CPU tensor.
         return wav_tensor, chatterbox_model.sr
