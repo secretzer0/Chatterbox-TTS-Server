@@ -104,6 +104,86 @@ def _resolve_bf16_setting() -> bool:
 
 BF16_ENABLED: bool = _resolve_bf16_setting()
 
+# --- Dead causal-mask buffers -------------------------------------------------
+# transformers registers GPT-2's legacy materialized causal mask as a bool buffer
+# `attn.bias` of shape (1, 1, n_positions, n_positions) on EVERY attention layer.
+# At n_positions=8196 that is 64.1 MiB per layer -- 1537.5 MiB across T3's 24
+# layers, which is comparable to the model's own 427M parameters.
+#
+# Under SDPA those buffers are never read: scaled_dot_product_attention builds
+# causality on the fly from is_causal. They are allocated, moved to the GPU, and
+# ignored. Measured on an RTX 3050 (4096 MiB): keeping them makes the model fail
+# to load at all -- 3.67 GiB resident, OOM 2 MiB short at s3gen.to(device), with
+# every CUDA toolchain and every precision setting. Dropping them loads in fp32
+# at 2665.9 MiB, peaks at 2952 MiB under synthesis, and runs at RTF 0.39.
+#
+# GATED ON THE ATTENTION IMPLEMENTATION ON PURPOSE. Under `eager`, GPT2Attention
+# really does index this buffer to mask its scores, and dropping it there would
+# not OOM -- it would silently produce a model that attends to the future. We
+# drop only when the implementation that ignores them is the one in use.
+_MASK_SAFE_ATTN = ("sdpa", "flash_attention_2")
+
+
+def _drop_unused_causal_masks(model) -> float:
+    """Free materialized causal masks the active attention path never reads.
+
+    Returns MiB freed (bool buffers are one byte per element).
+    """
+    tfmr = getattr(getattr(model, "t3", None), "tfmr", None)
+    impl = getattr(getattr(tfmr, "config", None), "_attn_implementation", None)
+    if impl not in _MASK_SAFE_ATTN:
+        logger.info(
+            f"Causal-mask buffers kept: attention implementation is '{impl}', "
+            f"which reads them. Only {_MASK_SAFE_ATTN} build causality on the fly."
+        )
+        return 0.0
+
+    # The model object is a plain wrapper, not an nn.Module -- walk the
+    # submodules it holds, each of which IS one.
+    dead, freed = [], 0
+    for attr in ("t3", "s3gen", "ve"):
+        module = getattr(model, attr, None)
+        if module is None:
+            continue
+        names = [
+            name
+            for name, buf in module.named_buffers()
+            if buf is not None and buf.dtype == torch.bool and buf.numel() > 1_000_000
+        ]
+        for name in names:
+            parent = module
+            *path, leaf = name.split(".")
+            for step in path:
+                parent = getattr(parent, step)
+            freed += getattr(parent, leaf).numel()
+            setattr(parent, leaf, None)
+            dead.append(f"{attr}.{name}")
+
+    freed_mib = freed / 2**20
+    if dead:
+        logger.info(
+            f"Dropped {len(dead)} unused causal-mask buffers under '{impl}': "
+            f"{freed_mib:.1f} MiB never moved to the device."
+        )
+    return freed_mib
+
+
+def _move_model(model, device: str) -> None:
+    """Move a loaded model's submodules to `device`.
+
+    The model is loaded on CPU so the masks above can be dropped BEFORE anything
+    reaches the GPU -- dropping them afterwards would not help, the peak has
+    already been paid.
+    """
+    for name in ("t3", "s3gen", "ve"):
+        module = getattr(model, name, None)
+        if module is not None:
+            module.to(device)
+    if getattr(model, "conds", None) is not None:
+        model.conds = model.conds.to(device)
+    model.device = device
+
+
 # --- Global Module Variables ---
 chatterbox_model: Optional[ChatterboxTTS] = None
 MODEL_LOADED: bool = False
@@ -438,8 +518,13 @@ def load_model() -> bool:
                     f"Turbo model supports paralinguistic tags: {TURBO_PARALINGUISTIC_TAGS}"
                 )
 
-            # Load the model using from_pretrained - handles HuggingFace downloads automatically
-            chatterbox_model = model_class.from_pretrained(device=model_device)
+            # Load on CPU first, drop the dead causal-mask buffers, THEN move.
+            # Order is the whole point: those buffers are 1537.5 MiB and moving
+            # them is what exhausts a small card, so they must never be moved.
+            chatterbox_model = model_class.from_pretrained(device="cpu")
+            _drop_unused_causal_masks(chatterbox_model)
+            if model_device != "cpu":
+                _move_model(chatterbox_model, model_device)
 
             # Convert T3 to bfloat16 if enabled.
             # Token generation is memory-bandwidth bound; bf16 halves bytes read per
